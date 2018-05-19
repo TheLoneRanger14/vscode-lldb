@@ -679,7 +679,7 @@ class DebugSession:
                     result = expressions.Value.unwrap(result)
                     if isinstance(result, lldb.SBValue):
                         is_container = result.GetNumChildren() > 0
-                        strvalue = self.get_var_value_not_null(result, self.global_format, is_container)
+                        strvalue = self.get_var_value_str(result, self.global_format, is_container)
                     else:
                         strvalue = str(result)
                     return strvalue
@@ -899,6 +899,7 @@ class DebugSession:
 
         container, container_vpath = container_info
         container_name = None
+        descendant_of_raw = False
         variables = collections.OrderedDict()
         if isinstance(container, LocalsScope):
             # args, locals, statics, in_scope_only
@@ -909,7 +910,7 @@ class DebugSession:
                 name = '[return value]'
                 dtype = ret_val.GetTypeName()
                 handle = self.get_var_handle(ret_val, name, container_handle)
-                value = self.get_var_value_not_null(ret_val, self.global_format, handle != 0)
+                value = self.get_var_value_str(ret_val, self.global_format, handle != 0)
                 variable = {
                     'name': name,
                     'value': value,
@@ -932,6 +933,9 @@ class DebugSession:
                 for segment in container_vpath[2:]:
                     container_name = compose_eval_name(container_name, segment)
             vars_iter = SBValueChildrenIter(container)
+            # PreferSyntheticValue is a sticky flag passed to children values,
+            # We use it to identify descendents of the [raw] node, since that's the only time we reset it.
+            descendant_of_raw = not container.GetPreferSyntheticValue()
 
         time_limit = time.clock() + self.evaluation_timeout
         for var in vars_iter:
@@ -940,13 +944,21 @@ class DebugSession:
                 continue
             dtype = var.GetTypeName()
             handle = self.get_var_handle(var, name, container_handle)
-            value = self.get_var_value_not_null(var, self.global_format, handle != 0)
+            value = self.get_var_value_str(var, self.global_format, handle != 0)
+
+            if not descendant_of_raw:
+                evalName = compose_eval_name(container_name, name)
+            else:
+                stm = lldb.SBStream()
+                var.GetExpressionPath(stm)
+                evalName = '/nat ' + stm.GetData()
+
             variable = {
                 'name': name,
                 'value': value,
                 'type': dtype,
                 'variablesReference': handle,
-                'evaluateName': compose_eval_name(container_name, name)
+                'evaluateName': evalName
             }
             # Ensure proper variable shadowing: if variable of the same name had already been added,
             # remove it and insert the new instance at the end.
@@ -1081,7 +1093,7 @@ class DebugSession:
         if isinstance(result, lldb.SBValue):
             dtype = result.GetTypeName();
             handle = self.get_var_handle(result, expr, None)
-            value = self.get_var_value_not_null(result, format, handle != 0)
+            value = self.get_var_value_str(result, format, handle != 0)
             return { 'result': value, 'type': dtype, 'variablesReference': handle }
         else: # Some Python value
             return { 'result': str(result), 'variablesReference': 0 }
@@ -1143,27 +1155,35 @@ class DebugSession:
                     (',Y', lldb.eFormatBytesWithASCII)]
 
     # Extracts a printable value from SBValue.
-    def get_var_value(self, var, format):
+    def get_var_value_str(self, var, format, is_container):
         expressions.analyze(var)
         var.SetFormat(format)
         value = None
 
-        # try var.GetValue(), except for pointers and references we may
-        # wish to display the summary of the referenced value instead.
-        is_pointer = var.GetType().GetTypeClass() in [lldb.eTypeClassPointer,
-                                                      lldb.eTypeClassReference]
-
-        if is_pointer and self.deref_pointers and format == lldb.eFormatDefault:
-            # try to get summary of the pointee
-            if var.GetValueAsUnsigned() == 0:
-                value = '<null>'
-            else:
-                value = var.GetSummary()
+        if self.deref_pointers and format == lldb.eFormatDefault:
+            if var.GetType().GetTypeClass() in [lldb.eTypeClassPointer, lldb.eTypeClassReference]:
+                # try to get summary of the pointee
+                if var.GetValueAsUnsigned() == 0:
+                    value = '<null>'
+                else:
+                    if var.IsSynthetic():
+                        value = var.GetSummary()
+                    if value is None:
+                        var = var.Dereference()
 
         if value is None:
             value = var.GetValue()
             if value is None:
                 value = var.GetSummary()
+
+        if value is None:
+            if is_container:
+                if self.container_summary:
+                    value =  self.get_container_summary(var, format)
+                else:
+                    value = '{...}'
+            else:
+                value = '<not available>'
 
         # deal with encodings
         if value is not None:
@@ -1172,18 +1192,6 @@ class DebugSession:
 
         return value
 
-    # Same as get_var_value, but with a fallback in case there is no value.
-    def get_var_value_not_null(self, var, format, is_container):
-        value = self.get_var_value(var, format)
-        if value is not None:
-            return value
-        if is_container:
-            if self.container_summary:
-                return self.get_container_summary(var, format)
-            else:
-                return '{...}'
-        else:
-            return '<not available>'
 
     def get_container_summary(self, var, format, maxsize=32):
         summary = ['{']
@@ -1250,7 +1258,7 @@ class DebugSession:
         error = lldb.SBError()
         if not var.SetValueFromCString(to_lldb_str(args['value']), error):
             raise UserError(error.GetCString())
-        return { 'value': self.get_var_value(var, self.global_format) }
+        return { 'value': self.get_var_value_str(var, self.global_format, False) }
 
     def DEBUG_disconnect(self, args):
         if self.launch_args is not None:
@@ -1291,6 +1299,11 @@ class DebugSession:
         self.deref_pointers = settings.get('dereferencePointers', True)
 
         self.container_summary = settings.get('containerSummary', True)
+
+        self.console_msg('Display settings: variable format=%s, show disassembly=%s, numeric pointer values=%s, container summaries=%s.' % (
+                         format, self.show_disassembly,
+                         'off' if self.deref_pointers else 'on',
+                         'on' if self.container_summary else 'off'))
 
     def DEBUG_provideContent(self, args):
         return { 'content': self.provide_content(args['uri']) }
